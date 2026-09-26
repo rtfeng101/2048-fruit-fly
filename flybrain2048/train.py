@@ -60,12 +60,13 @@ def play_batch(model, n_games, rng, max_moves, greedy=False):
     logps = [[] for _ in games]
     rewards = [[] for _ in games]
     entropies = []
+    device = next(model.parameters()).device
     W = model.effective_weights()  # computed once, reused for every move
     for t in range(max_moves):
         active = [i for i, g in enumerate(games) if not g.done]
         if not active:
             break
-        obs = torch.tensor(np.stack([encode_board(games[i].board) for i in active]))
+        obs = torch.tensor(np.stack([encode_board(games[i].board) for i in active]), device=device)
         valid = np.stack([games[i].valid_moves() for i in active])
         logits = masked_logits(model(obs, W=W), valid)
         dist = Categorical(logits=logits)
@@ -91,6 +92,8 @@ def train(cfg, resume=False):
     """Run `train.updates` updates, starting fresh or (resume=True) continuing from
     runs/<run_name>/last.pt, appending to the same metrics.csv."""
     tc = cfg["train"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
     conn = load_connectome(cfg["connectome"])
     print("Connectome:", conn.summary())
 
@@ -101,6 +104,7 @@ def train(cfg, resume=False):
         if not os.path.exists(last_path):
             raise SystemExit(f"Nothing to resume: {last_path} doesn't exist.")
         model, ckpt = load_model(conn, last_path)
+        model.to(device)
         if ckpt["cfg"]["model"] != cfg["model"]:
             print("  (using this run's original `model:` settings; changes to them in "
                   "config.yaml need a new run_name)")
@@ -121,6 +125,7 @@ def train(cfg, resume=False):
                          f"`train --resume`, or set a new train.run_name in config.yaml.")
     else:
         model = build_model(cfg, conn)
+        model.to(device)
         opt = torch.optim.Adam(model.parameters(), lr=tc["lr"])
 
     # Offset the seed so a resumed run doesn't replay the same games.
@@ -143,7 +148,7 @@ def train(cfg, resume=False):
         mu, sd = flat.mean(), flat.std() + 1e-8
         loss = 0.0
         for lp, R in zip(logps, rets):
-            adv = torch.tensor((R - mu) / sd)
+            adv = torch.tensor((R - mu) / sd, device=device)
             loss = loss - (torch.stack(lp) * adv).sum()
         loss = loss / len(flat) - tc["entropy_coef"] * ent
 
@@ -188,8 +193,11 @@ def evaluate(cfg, checkpoint=None, n_games=50, random_agent=False):
             tiles.append(g.max_tile)
         label = "random"
     else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Device:", device)
         conn = load_connectome(cfg["connectome"])
         model = load_model(conn, checkpoint)[0] if checkpoint else build_model(cfg, conn)
+        model.to(device)
         model.eval()
         with torch.no_grad():
             games, *_ = play_batch(model, n_games, rng, 100000, greedy=True)
