@@ -1,0 +1,6 @@
+numpy
+torch
+pygame-ce        # drop-in for pygame (import pygame); has wheels for newer Pythons
+pyyaml
+pandas
+neuprint-python   # only needed for source: neuprint

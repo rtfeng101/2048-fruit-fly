@@ -1,0 +1,44 @@
+connectome:
+  source: neuprint            # "synthetic" (offline) or "neuprint" (real male CNS)
+  cache_path: data/connectome_{source}.npz
+  morphology_path: data/morphology_{source}.npz   # neuron shapes for `play` (fetch --shapes)
+
+  synthetic:
+    n_in: 256
+    n_hidden: 2000
+    n_out: 64
+    p: 0.05                    # connection probability
+    frac_inhib: 0.3
+    seed: 0
+
+  neuprint:
+    server: neuprint.janelia.org
+    dataset: male-cns:v1.0     # check the exact name/version on neuprint.janelia.org
+    output_type_regex: "DN[a-z][0-9].*"  # descending neurons (DNa01, DNg12, ...) = motor commands;
+                                         # plain "DN.*" also matches clock (DN1a) + neurosecretory (DNES) cells
+    n_out: 64
+    n_hidden: 2000
+    n_in: 256
+    min_weight: 5              # ignore connections weaker than this many synapses
+    skeleton_grid: 100         # snap neuron shapes to this many voxels (bigger = smaller file)
+    outline_rois: null         # brain regions for the outline; null = all top-level regions
+
+model:
+  steps: 8                     # recurrent time steps per move ("thinking time")
+  dt: 0.5
+  w_scale: 10.0                # overall connectome gain; at 1.0 the board signal fades out
+                               # before reaching the DNs (too low = fly ignores the board)
+  train_synapses: true         # false = only train sensory input + readout + biases
+  normalize_readout: true      # rescale DN activity so small differences between moves count
+
+train:
+  run_name: gain10
+  updates: 500
+  batch_games: 8
+  max_moves: 2000
+  lr: 0.003
+  gamma: 0.99
+  entropy_coef: 0.01
+  print_every: 10
+  checkpoint_every: 1000       # also save runs/<run_name>/update_NNNNNN.pt every N updates; 0 = off
+  seed: 0
