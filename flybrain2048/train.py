@@ -1,8 +1,9 @@
-"""Train the fly brain to play 2048 with REINFORCE (policy gradient).
+"""Train the fly brain to play 2048 with PPO (actor-critic policy gradient).
 
-Each update: play `batch_games` games in parallel until they all end, then
-nudge the learnable parameters so moves followed by high reward become more
-likely. Simple, noisy, and a great baseline to improve on (see README ideas).
+Each update: play `batch_games` games in parallel until they all end, then take a
+few passes over those moves. The fly's "dopamine" critic predicts how
+much reward is still to come; moves that turned out better than it expected become
+more likely, worse ones less likely, and PPO's clipping keeps each step small.
 """
 import csv
 import os
@@ -13,7 +14,7 @@ import torch
 from torch.distributions import Categorical
 
 from .connectome import load_connectome
-from .game import Game2048, encode_board
+from .game import SYM_ACTIONS, Game2048, encode_board, transform_board
 from .model import FlyBrainNet, masked_logits
 
 
@@ -21,7 +22,8 @@ def build_model(cfg, conn):
     m = cfg["model"]
     return FlyBrainNet(conn, obs_dim=256, steps=m["steps"], dt=m["dt"],
                        train_synapses=m["train_synapses"], w_scale=m["w_scale"],
-                       normalize_readout=m.get("normalize_readout", False))
+                       normalize_readout=m.get("normalize_readout", False),
+                       readout=m.get("readout", "grouped"), critic=m.get("critic", False))
 
 
 def save_checkpoint(model, conn, cfg, path, **extra):
@@ -55,37 +57,86 @@ def shaped_reward(gained, done, t):
     return r - (10.0 if done else 0.0)
 
 
-def play_batch(model, n_games, rng, max_moves, greedy=False):
+def play_batch(model, n_games, rng, max_moves, greedy=False, augment=False):
+    """Play n_games to the end, without gradients. With augment, each move is chosen
+    on a randomly rotated/mirrored copy of the board (and mapped back).
+
+    Returns the games and, per game, what PPO learns from: the observation the fly
+    saw, its valid moves and move (both in that possibly transformed frame), the move's
+    log-probability, the critic's value and the reward.
+    """
     games = [Game2048(seed=int(rng.integers(1 << 31))) for _ in range(n_games)]
-    logps = [[] for _ in games]
-    rewards = [[] for _ in games]
-    entropies = []
+    keys = ("obs", "valid", "act", "logp", "value", "reward")
+    traj = [{k: [] for k in keys} for _ in games]
     device = next(model.parameters()).device
     W = model.effective_weights()  # computed once, reused for every move
     for t in range(max_moves):
         active = [i for i, g in enumerate(games) if not g.done]
         if not active:
             break
-        obs = torch.tensor(np.stack([encode_board(games[i].board) for i in active]), device=device)
-        valid = np.stack([games[i].valid_moves() for i in active])
-        logits = masked_logits(model(obs, W=W), valid)
+        sym = rng.integers(8, size=len(active)) if augment else np.zeros(len(active), int)
+        obs = np.stack([encode_board(transform_board(games[i].board, s))
+                        for i, s in zip(active, sym)])
+        valid = np.zeros((len(active), 4), bool)
+        for j, (i, s) in enumerate(zip(active, sym)):
+            valid[j, SYM_ACTIONS[s]] = games[i].valid_moves()
+        if model.dopamine is not None:
+            logits, value = model.policy_value(torch.tensor(obs, device=device), W)
+        else:  # older checkpoints without a critic can still be played / evaluated
+            logits = model(torch.tensor(obs, device=device), W=W)
+            value = torch.zeros(len(active), device=device)
+        logits = masked_logits(logits, valid)
         dist = Categorical(logits=logits)
         acts = logits.argmax(-1) if greedy else dist.sample()
-        lp = dist.log_prob(acts)
-        entropies.append(dist.entropy().mean())
-        for j, i in enumerate(active):
-            _, gained, done, _ = games[i].step(int(acts[j]))
-            logps[i].append(lp[j])
-            rewards[i].append(shaped_reward(gained, done, t))
-    return games, logps, rewards, torch.stack(entropies).mean()
+        logp, acts, value = dist.log_prob(acts).cpu().numpy(), acts.cpu().numpy(), value.cpu().numpy()
+        for j, (i, s) in enumerate(zip(active, sym)):
+            real = int(np.flatnonzero(SYM_ACTIONS[s] == acts[j])[0])  # back to the real board
+            _, gained, done, _ = games[i].step(real)
+            for k, v in zip(keys, (obs[j], valid[j], acts[j], logp[j], value[j],
+                                   shaped_reward(gained, done, t))):
+                traj[i][k].append(v)
+    return games, traj
 
 
-def discounted(rs, gamma):
-    out, g = np.zeros(len(rs), dtype=np.float32), 0.0
-    for k in reversed(range(len(rs))):
-        g = rs[k] + gamma * g
-        out[k] = g
-    return out
+def gae(rewards, values, gamma, lam):
+    """Generalized advantage estimation for one game (which ends at its last move).
+
+    delta_t = r_t + gamma * V(t+1) - V(t) is the reward-prediction error, the signal
+    dopamine neurons are thought to carry. Advantages are discounted sums of it."""
+    adv, last = np.zeros(len(rewards), np.float32), 0.0
+    for t in reversed(range(len(rewards))):
+        next_v = values[t + 1] if t + 1 < len(rewards) else 0.0
+        last = rewards[t] + gamma * next_v - values[t] + gamma * lam * last
+        adv[t] = last
+    return adv, adv + np.asarray(values, np.float32)
+
+
+def ppo_update(model, opt, batch, tc):
+    """A few passes of clipped-PPO minibatch steps over one batch of moves.
+    Returns mean (policy loss, value loss, entropy)."""
+    n = len(batch["act"])
+    stats = []
+    for _ in range(tc.get("ppo_epochs", 4)):
+        for mb in torch.randperm(n, device=batch["act"].device).split(tc.get("minibatch", 2048)):
+            logits, value = model.policy_value(batch["obs"][mb])
+            dist = Categorical(logits=masked_logits(logits, batch["valid"][mb]))
+            adv = batch["adv"][mb]
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            ratio = torch.exp(dist.log_prob(batch["act"][mb]) - batch["logp"][mb])
+            clip = tc.get("clip", 0.2)
+            pg = -torch.min(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
+            # Huber loss: returns are large early on, and this keeps the critic from
+            # swamping the policy's share of the (clipped) gradient.
+            v_loss = torch.nn.functional.smooth_l1_loss(value, batch["ret"][mb])
+            ent = dist.entropy().mean()
+            loss = pg + tc.get("value_coef", 0.5) * v_loss - tc["entropy_coef"] * ent
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            stats.append((pg.item(), v_loss.item(), ent.item()))
+    return np.mean(stats, 0)
 
 
 def train(cfg, resume=False):
@@ -104,6 +155,9 @@ def train(cfg, resume=False):
         if not os.path.exists(last_path):
             raise SystemExit(f"Nothing to resume: {last_path} doesn't exist.")
         model, ckpt = load_model(conn, last_path)
+        if model.dopamine is None:
+            raise SystemExit(f"{run_dir}/ was trained with the old REINFORCE setup (no dopamine "
+                             f"critic), which PPO needs. Start a new train.run_name instead.")
         model.to(device)
         if ckpt["cfg"]["model"] != cfg["model"]:
             print("  (using this run's original `model:` settings; changes to them in "
@@ -124,6 +178,8 @@ def train(cfg, resume=False):
         raise SystemExit(f"{run_dir}/ already has a trained model. Continue it with "
                          f"`train --resume`, or set a new train.run_name in config.yaml.")
     else:
+        if not cfg["model"].get("critic", False):
+            raise SystemExit("PPO training needs the dopamine critic: set model.critic: true.")
         model = build_model(cfg, conn)
         model.to(device)
         opt = torch.optim.Adam(model.parameters(), lr=tc["lr"])
@@ -136,35 +192,37 @@ def train(cfg, resume=False):
     log = open(metrics_path, "a" if resume else "w", newline="")
     writer = csv.writer(log)
     if not resume:
-        writer.writerow(["update", "mean_score", "max_tile", "mean_moves", "entropy", "loss", "secs"])
+        writer.writerow(["update", "mean_score", "max_tile", "mean_moves", "entropy", "loss",
+                         "value_loss", "secs"])
 
     for update in range(start + 1, start + tc["updates"] + 1):
         t0 = time.time()
-        games, logps, rewards, ent = play_batch(model, tc["batch_games"], rng, tc["max_moves"])
+        with torch.no_grad():
+            games, traj = play_batch(model, tc["batch_games"], rng, tc["max_moves"],
+                                     augment=tc.get("augment", False))
 
-        # Returns, normalized across the whole batch (acts as a baseline).
-        rets = [discounted(r, tc["gamma"]) for r in rewards]
-        flat = np.concatenate(rets)
-        mu, sd = flat.mean(), flat.std() + 1e-8
-        loss = 0.0
-        for lp, R in zip(logps, rets):
-            adv = torch.tensor((R - mu) / sd, device=device)
-            loss = loss - (torch.stack(lp) * adv).sum()
-        loss = loss / len(flat) - tc["entropy_coef"] * ent
-
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        # Rewards are scaled down so the critic's targets stay near unit size.
+        scale, adv, ret = tc.get("reward_scale", 0.1), [], []
+        for tr in traj:
+            a, r = gae(scale * np.array(tr["reward"]), tr["value"], tc["gamma"],
+                       tc.get("gae_lambda", 0.95))
+            adv.append(a)
+            ret.append(r)
+        batch = {k: torch.tensor(np.concatenate([tr[k] for tr in traj]), device=device)
+                 for k in ("obs", "valid", "act", "logp")}
+        batch["adv"] = torch.tensor(np.concatenate(adv), device=device)
+        batch["ret"] = torch.tensor(np.concatenate(ret), device=device)
+        pg, v_loss, ent = ppo_update(model, opt, batch, tc)
 
         scores = [g.score for g in games]
         row = [update, np.mean(scores), max(g.max_tile for g in games),
-               np.mean([g.moves for g in games]), ent.item(), loss.item(), time.time() - t0]
+               np.mean([g.moves for g in games]), ent, pg, v_loss, time.time() - t0]
         writer.writerow(row)
         log.flush()
         if update % tc["print_every"] == 0 or update == 1:
             print(f"[{update:5d}] score {row[1]:8.1f} | best tile {row[2]:5d} | "
-                  f"moves {row[3]:6.1f} | entropy {row[4]:.3f} | {row[6]:.1f}s")
+                  f"moves {row[3]:6.1f} | entropy {row[4]:.3f} | critic loss {row[6]:.3f} | "
+                  f"{row[7]:.1f}s")
         if np.mean(scores) > best:
             best = float(np.mean(scores))
             save_checkpoint(model, conn, cfg, os.path.join(run_dir, "best.pt"),
@@ -200,7 +258,7 @@ def evaluate(cfg, checkpoint=None, n_games=50, random_agent=False):
         model.to(device)
         model.eval()
         with torch.no_grad():
-            games, *_ = play_batch(model, n_games, rng, 100000, greedy=True)
+            games, _ = play_batch(model, n_games, rng, 100000, greedy=True)
         scores, tiles = [g.score for g in games], [g.max_tile for g in games]
         label = checkpoint or "untrained fly"
     vals, counts = np.unique(tiles, return_counts=True)

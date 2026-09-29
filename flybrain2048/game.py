@@ -79,6 +79,19 @@ class Game2048:
         return int(self.board.max())
 
 
+# 2048 plays the same rotated or mirrored, so every board has 8 equivalent versions.
+# Symmetry s rotates the board s % 4 quarter-turns counter-clockwise, then mirrors it
+# left-right if s >= 4. SYM_ACTIONS[s][a] is where move a ends up on the transformed board.
+_MIRROR = np.array([0, 3, 2, 1])
+SYM_ACTIONS = np.array([_MIRROR[(np.arange(4) - s % 4) % 4] if s >= 4 else (np.arange(4) - s) % 4
+                        for s in range(8)])
+
+
+def transform_board(board, s):
+    b = np.rot90(board, s % 4)
+    return np.fliplr(b) if s >= 4 else b
+
+
 def encode_board(board, levels=16):
     """One-hot encode each cell by log2(tile): 16 cells x 16 levels = 256 floats.
 

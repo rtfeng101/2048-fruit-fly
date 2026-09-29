@@ -1,8 +1,11 @@
+# The original 2,320-neuron circuit (no dopamine neurons), backed up in data/circuit_2320/.
+# Use it to eval/play runs trained on it (gain10, ppo_dopamine):
+#   python -m flybrain2048 eval --config config_2320.yaml --checkpoint runs/ppo_dopamine/best.pt
 connectome:
   source: neuprint            # "synthetic" (offline) or "neuprint" (real male CNS)
-  cache_path: data/connectome_{source}.npz
-  morphology_path: data/morphology_{source}.npz   # neuron shapes for `play` (fetch --shapes)
-  synapse_path: data/synapses_{source}.npz        # synapse locations for signal paths (fetch --shapes)
+  cache_path: data/circuit_2320/connectome_{source}.npz
+  morphology_path: data/circuit_2320/morphology_{source}.npz   # neuron shapes for `play` (fetch --shapes)
+  synapse_path: data/circuit_2320/synapses_{source}.npz        # synapse locations for signal paths (fetch --shapes)
 
   synthetic:
     n_in: 256
@@ -19,11 +22,11 @@ connectome:
     output_type_regex: "DN[a-z][0-9].*"  # descending neurons (DNa01, DNg12, ...) = motor commands;
                                          # plain "DN.*" also matches clock (DN1a) + neurosecretory (DNES) cells
     n_out: 64                  # kept at 64 so the move readout is the same as before
-    n_hidden: 4000             # doubled from 2000 (with n_in: ~4,600 neurons in all)
-    n_in: 512                  # doubled from 256
+    n_hidden: 2000
+    n_in: 256
     min_weight: 5              # ignore connections weaker than this many synapses
     dopamine:                  # dopamine neurons for the critic to read (model.critic: dopamine)
-      n: 64                    # how many: those receiving the most synapses from the circuit
+      n: 0                     # this circuit was built before dopamine neurons were added
       type_regex: "(PAM|PPL1|PPL2|PPM).*"   # dopaminergic cell types (check the names on neuPrint)
     skeleton_grid: 100         # snap neuron shapes to this many voxels (bigger = smaller file)
     path_connections: 3000     # strongest connections to fetch a synapse location for, so
@@ -39,13 +42,13 @@ model:
   normalize_readout: true      # rescale DN activity so small differences between moves count
   readout: learned             # "grouped" = each move is the plain average of its DNs (round
                                # robin); "learned" = learn how much each DN counts per move
-  critic: dopamine             # the critic PPO needs, predicting reward still to come. "dopamine"
+  critic: brain                # the critic PPO needs, predicting reward still to come. "dopamine"
                                # reads it from the circuit's dopamine neurons, "brain" from all neurons
 
 train:
-  run_name: ppo_dan_2x
+  run_name: ppo_dopamine
   updates: 500
-  batch_games: 128             # games played per update (bigger batches use the GPU better)
+  batch_games: 32              # games played per update
   max_moves: 2000
   lr: 0.001
   gamma: 0.99
