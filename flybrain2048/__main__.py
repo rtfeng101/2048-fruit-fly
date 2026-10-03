@@ -8,6 +8,8 @@
           (--resume continues that run from its last.pt)
   eval    score a checkpoint (or --random for a baseline)
   play    open the visual display
+  plot    save graphs of training to runs/<run_name>/plots/ (--eval to also
+          score every checkpoint)
 """
 import argparse
 
@@ -16,7 +18,7 @@ import yaml
 
 def main():
     ap = argparse.ArgumentParser(prog="flybrain2048")
-    ap.add_argument("command", choices=["fetch", "train", "eval", "play"])
+    ap.add_argument("command", choices=["fetch", "train", "eval", "play", "plot"])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--checkpoint", default=None, help="e.g. runs/ppo_dan_2x/best.pt")
     ap.add_argument("--refresh", action="store_true", help="rebuild the cached connectome")
@@ -29,6 +31,11 @@ def main():
                     help="train: continue runs/<run_name>/ from last.pt")
     ap.add_argument("--random", action="store_true", help="eval a random-move baseline")
     ap.add_argument("--games", type=int, default=50)
+    ap.add_argument("--runs", nargs="+", default=None,
+                    help="plot: runs to draw together (default: train.run_name)")
+    ap.add_argument("--window", type=int, default=25, help="plot: updates per rolling mean")
+    ap.add_argument("--eval", action="store_true",
+                    help="plot: also play --games games with every checkpoint of the first run")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -50,6 +57,9 @@ def main():
     elif args.command == "play":
         from .visualize import run
         run(cfg, args.checkpoint)
+    elif args.command == "plot":
+        from .plots import make_plots
+        make_plots(cfg, args.runs, args.window, args.eval, args.games)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ Every command reads `config.yaml` unless you pass `--config <file>`.
 | `eval --checkpoint <file.pt>` | Score a checkpoint over `--games` games (default 50), always taking the most likely move. |
 | `eval --random` | Score random moves, as a baseline. |
 | `play [--checkpoint <file.pt>]` | Open the display. Without a checkpoint, the fly is untrained. |
+| `plot` | Save graphs of training (from `metrics.csv`) to `runs/<run_name>/plots/training.png`. |
+| `plot --runs <a> <b>` | Draw several runs on the same graphs, to compare them. |
+| `plot --eval` | Also play `--games` games with every checkpoint of the run (always the most likely move) and graph the spread of scores and tiles in `performance.png`. Results are cached in `eval_games.csv`, so only new checkpoints are played. |
 
 **Runs and configs.** A run's name is `train.run_name` in the config, and it's saved to
 `runs/<run_name>/` (`best.pt`, `last.pt`, `metrics.csv`). `best.pt` is chosen by the

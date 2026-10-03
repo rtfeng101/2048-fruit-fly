@@ -3,4 +3,5 @@ torch
 pygame-ce        # drop-in for pygame (import pygame); has wheels for newer Pythons
 pyyaml
 pandas
+matplotlib       # for `plot`
 neuprint-python   # only needed for source: neuprint
